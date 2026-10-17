@@ -57,11 +57,13 @@ end
 function dora_maira_rheology(; gravity = dora_maira_gravity())
     # Schmalholz & Schenker (2016), their eq. (1): the reported flow laws are
     # axial-compression laws, so GeoParams must apply its tensor correction.
-    # In the weak layer η is scaled by f = 10⁻³.  Since η ∝ A^(-1/n), this is
-    # represented by A / f^n and remains valid as the strain rate evolves.
+    # The reference model uses f = 1/50 outside the layer, f = 1/1000 in the
+    # layer, and f = 1 for the ellipse. Since η ∝ A^(-1/n), a viscosity factor
+    # f is represented by A / f^n and remains valid as strain rate evolves.
+    matrix_factor = 1.0 / 50.0
     weak_layer_factor = 1.0e-3
     peridotite = DislocationCreep(;
-        A = 2.0e-21,
+        A = 2.0e-21 / matrix_factor^4,
         n = 4.0,
         E = 471.0e3,
         V = 0.0,
@@ -423,8 +425,8 @@ function dora_maira_vertical_weak_zone(
     temperature = dora_maira_temperature(grid)
     dt = 1.0e11
     args = (; T = temperature, P = stokes.P, dt)
-    # viscosity_cutoff = 1e16, 1e22
-    viscosity_cutoff = 1e18, 1e22
+    viscosity_cutoff = 1e16, 1e22
+    # viscosity_cutoff = 1e18, 1e22
     compute_ρg!(ρg, phase_ratios, rheology, args)
     initialize_dora_maira_pressure!(stokes.P, grid, gravity)
     stokes.P0 .= stokes.P
@@ -433,7 +435,7 @@ function dora_maira_vertical_weak_zone(
     flow_bcs!(stokes, flow_bcs)
     update_halo!(@velocity(stokes)...)
 
-    dyrel = DYREL(backend, stokes, rheology, phase_ratios, ϕ, grid.di, dt; ϵ = 1e-4)
+    dyrel = DYREL(backend, stokes, rheology, phase_ratios, ϕ, grid.di, dt, γfact = 20.0; ϵ = 1e-4)
     observation = (; field = :Vy, weights = ellipse_observation_weights(
         stokes, grid, ellipse_center, ellipse_axes
     ))
@@ -442,36 +444,45 @@ function dora_maira_vertical_weak_zone(
 
     for step in 1:nsteps
         final_adjoint_step = adjoint && step == nsteps
-        args = (; T = temperature, P = stokes.P, dt)
-        output = solve_VariationalDYREL!(
-            stokes,
-            final_adjoint_step ? stokes_ad : nothing,
-            ρg,
-            dyrel,
-            flow_bcs,
-            phase_ratios,
-            ϕ,
-            rheology,
-            args,
-            grid,
-            dt,
-            igg;
-            verbose_PH,
-            verbose_DR = false,
-            iterMax = 50_000,
-            total_iterMax = 50_000,
-            nout = 20,
-            # A 10% inner reduction is sufficient before each nonlinear PH update;
-            # forcing 1% here exhausts the inner budget on the 100 m weak-zone grid.
-            rel_drop = 1e-2,
-            viscosity_relaxation = 1.0e-2,
-            viscosity_cutoff,
-            linear_viscosity = false,
-            air_phase = 0,
-            adjoint = final_adjoint_step,
-            observation,
-            gradients = final_adjoint_step ? gradients : (;),
-        )
+        # Continuation reaches the paper's 10¹⁶ Pa s lower bound from a well-conditioned
+        # initial Stokes solve.  Only the final stage is used for the physical time step.
+        cutoff_stages = step == 1 ? (
+            (1e18, viscosity_cutoff[2]), (1e17, viscosity_cutoff[2]), viscosity_cutoff,
+        ) : (viscosity_cutoff,)
+        for (stage, active_cutoff) in pairs(cutoff_stages)
+            final_stage = stage == lastindex(cutoff_stages)
+            args = (; T = temperature, P = stokes.P, dt)
+            output = solve_VariationalDYREL!(
+                stokes,
+                final_adjoint_step && final_stage ? stokes_ad : nothing,
+                ρg,
+                dyrel,
+                flow_bcs,
+                phase_ratios,
+                ϕ,
+                rheology,
+                args,
+                grid,
+                dt,
+                igg;
+                verbose_PH,
+                verbose_DR = false,
+                iterMax = 50_000,
+                total_iterMax = 200_000,
+                nout = 10,
+                # A 10% inner reduction is sufficient before each nonlinear PH update;
+                # forcing 1% here exhausts the inner budget on the 100 m weak-zone grid.
+                rel_drop = 1e-1,
+                viscosity_relaxation = 1.0e-2,
+                viscosity_cutoff = active_cutoff,
+                linear_viscosity = false,
+                air_phase = 0,
+                adjoint = final_adjoint_step && final_stage,
+                observation,
+                gradients = final_adjoint_step && final_stage ? gradients : (;),
+            )
+            final_stage || copyto!(stokes.P0, stokes.P)
+        end
 
         if plot_results && (step % plot_every == 0 || step == nsteps)
             plot_dora_maira!(
