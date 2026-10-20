@@ -1,13 +1,33 @@
+const isCUDA = false
+
+@static if isCUDA
+    using CUDA
+    CUDA.allowscalar(false)
+end
+
 using JustRelax, JustRelax.JustRelax2D
 using JustPIC
 using GeoParams
 using CairoMakie
 using ParallelStencil, ParallelStencil.FiniteDifferences2D
 
-@init_parallel_stencil(Threads, Float64, 2)
+const backend = @static if isCUDA
+    JustRelax.CUDABackend
+else
+    JustRelax.CPUBackend
+end
 
-const backend = JustRelax.CPUBackend
-const particle_backend = JustPIC.CPU
+const particle_backend = @static if isCUDA
+    CUDA.CUDABackend
+else
+    JustPIC.CPU
+end
+
+@static if isCUDA
+    @init_parallel_stencil(CUDA, Float64, 2)
+else
+    @init_parallel_stencil(Threads, Float64, 2)
+end
 
 if !isdefined(@__MODULE__, :set_dora_maira_phases!)
     # `@parallel_indices` creates auxiliary constants while it expands. Deferring its expansion
@@ -24,6 +44,18 @@ if !isdefined(@__MODULE__, :set_dora_maira_phases!)
                 ((x - x0) / a)^2 + ((y - y0) / b)^2 ≤ 1 && (phase = 3.0)
                 @index phases[ip, i, j] = phase
             end
+            return nothing
+        end
+    end)
+end
+
+if !isdefined(@__MODULE__, :uhp_observation_weights!)
+    Core.eval(@__MODULE__, quote
+        @parallel_indices (i, j) function uhp_observation_weights!(
+                weights, phase_ratios_Vy, uhp_phase
+            )
+            # Vy has one ghost column on each horizontal side.
+            @inbounds weights[i + 1, j] = @index phase_ratios_Vy[uhp_phase, i, j]
             return nothing
         end
     end)
@@ -116,8 +148,9 @@ end
 
 function dora_maira_temperature(grid)
     # Paper initial condition: 500 °C at the top, increasing linearly to 770 °C at 110 km.
-    temperature = @zeros(grid.ni .+ 2...)
-    x, y = grid.xci
+    # Build the small initial field on the host, then transfer it to the selected backend.
+    temperature = zeros(Float64, (grid.ni .+ 2)...)
+    x, y = Array.(grid.xci)
     dTdy = (770.0 - 500.0) / 110e3
     @views begin
         temperature[2:(end - 1), 2:(end - 1)] .= [
@@ -130,28 +163,34 @@ function dora_maira_temperature(grid)
         temperature[1, :] .= temperature[2, :]
         temperature[end, :] .= temperature[end - 1, :]
     end
-    return temperature
+    return PTArray(backend)(temperature)
 end
 
 function initialize_dora_maira_pressure!(P, grid, gravity; ρref = 3300.0)
     # ∇P = -ρref g balances the uniform mantle in JustRelax's `-∇P - ρg` residual.
     gx, _, gz = compute_gravity(gravity)
-    x, y = grid.xci
+    x, y = Array.(grid.xci)
     @assert size(P) == (length(x), length(y))
-    P .= [ρref * (gx * (x[end] - xi) + gz * (y[end] - yj)) for xi in x, yj in y]
+    copyto!(P, [ρref * (gx * (x[end] - xi) + gz * (y[end] - yj)) for xi in x, yj in y])
     return P
 end
 
-function ellipse_observation_weights(stokes, grid, center, axes)
-    x, y = grid.xci[1], grid.xvi[2]
-    a, b = axes
-    weights = zeros(eltype(stokes.V.Vy), size(stokes.V.Vy))
-    for j in eachindex(y), i in eachindex(x)
-        ((x[i] - center[1]) / a)^2 + ((y[j] - center[2]) / b)^2 <= 1 &&
-            (weights[i + 1, j] = one(eltype(weights)))
-    end
-    @assert any(!iszero, weights)
-    return weights
+"""
+    uhp_observation(phase_ratios, uhp_phase, Vy)
+
+Build an adjoint objective for the mean vertical velocity of the current UHP body. The weights
+are the UHP phase fraction at the `Vy` nodes, so the observation follows the particles as the
+initial ellipse translates and deforms.
+"""
+function uhp_observation(phase_ratios, uhp_phase, Vy)
+    weights = similar(Vy)
+    fill!(weights, 0)
+    ratios = phase_ratios.Vy
+    @parallel (@idx size(ratios)) uhp_observation_weights!(weights, ratios, uhp_phase)
+    total_weight = sum(weights)
+    iszero(total_weight) && error("the advected UHP phase has no observation weight")
+    weights ./= total_weight
+    return (; field = :Vy, weights)
 end
 
 function center_refined_vertices(nx, lx; weak_width = 5e3, weak_spacing = 100.0)
@@ -274,63 +313,57 @@ function gravity_key!(axis, x, y, gravity)
     xmin, xmax = extrema(x)
     ymin, ymax = extrema(y)
     xspan, yspan = xmax - xmin, ymax - ymin
-    length = 0.20 * min(xspan, yspan)
-    dx, dy = length .* (gx, gz) ./ hypot(gx, gz)
-    x0, y0 = xmax - 0.08 * xspan, ymax - 0.10 * yspan
-    x1, y1 = x0 + dx, y0 + dy
-    padx, pady = 0.035 * xspan, 0.040 * yspan
+    # A compact, opaque legend keeps the vector and label readable over any phase colour.
+    # DataAspect() preserves the physical direction of the arrow.
+    magnitude = hypot(gx, gz)
+    iszero(magnitude) && return nothing
+    left, right = xmax - 0.49 * xspan, xmax - 0.04 * xspan
+    bottom, top = ymax - 0.15 * yspan, ymax - 0.035 * yspan
+    midy = (bottom + top) / 2
+    arrow_length = 0.12 * min(xspan, yspan)
+    dx, dy = arrow_length .* (gx, gz) ./ magnitude
+    midx = left + 0.10 * xspan
 
-    # An opaque key separates the annotation from the colormap at publication scale.
     poly!(
         axis,
-        Point2f[
-            (min(x0, x1) - padx, min(y0, y1) - pady),
-            (x0 + padx, min(y0, y1) - pady),
-            (x0 + padx, y0 + 1.8 * pady),
-            (min(x0, x1) - padx, y0 + 1.8 * pady),
-        ]; color = (:white, 0.92), strokecolor = (:black, 0.65), strokewidth = 1.2,
+        Point2f[(left, bottom), (right, bottom), (right, top), (left, top)];
+        color = :white, strokecolor = :gray60, strokewidth = 0.7,
     )
     arrows2d!(
-        axis, [x0], [y0], [dx], [dy]; color = :black, shaftwidth = 4,
-        tipwidth = 17, tiplength = 13,
+        axis, [midx - dx / 2], [midy - dy / 2], [dx], [dy];
+        color = :black, shaftwidth = 2, tipwidth = 9, tiplength = 10,
     )
-    text!(axis, x0, y0 + 0.8 * pady; text = "gravity", align = (:right, :bottom), color = :black, fontsize = 22)
+    labelx = left + 0.20 * xspan
+    text!(
+        axis, labelx, midy + 0.018 * yspan; text = "Gravity",
+        align = (:left, :center), color = :black, fontsize = 15, font = :bold,
+    )
+    text!(
+        axis, labelx, midy - 0.018 * yspan;
+        text = "$(round(magnitude; digits = 2)) m s⁻²",
+        align = (:left, :center), color = :gray25, fontsize = 12,
+    )
     return nothing
 end
 
 function plot_dora_maira!(
-        figdir, step, grid, phase_ratios, stokes, gradients, gravity, ellipse_center,
-        ellipse_axes; show_sensitivity = false,
+        figdir, step, grid, phase_ratios, stokes, gravity,
     )
     take(figdir)
     Vx, Vy = @velocity(stokes)
     Vx_v, Vy_v = @zeros(size(stokes.P) .+ 1...), @zeros(size(stokes.P) .+ 1...)
     velocity2vertex!(Vx_v, Vy_v, Vx, Vy)
 
-    xci, xvi = grid.xci ./ 1e3, grid.xvi ./ 1e3
-    uhp_fraction = getindex.(Array(phase_ratios.center), 3)
-    θ = range(0, 2π; length = 129)
-    ellipse_x = ellipse_center[1] / 1e3 .+ ellipse_axes[1] / 1e3 .* cos.(θ)
-    ellipse_y = ellipse_center[2] / 1e3 .+ ellipse_axes[2] / 1e3 .* sin.(θ)
+    xci, xvi = Array.(grid.xci) ./ 1e3, Array.(grid.xvi) ./ 1e3
+    # Transfer the backing storage first; Array(::CellArray) otherwise scalar-indexes it.
+    uhp_fraction = getindex.(JustPIC.CPUCellArray(phase_ratios.center), 3)
     velocity_magnitude = hypot.(Array(Vx_v), Array(Vy_v))
-    function symmetric_range(A)
-        maximum_abs = maximum(abs, A)
-        return iszero(maximum_abs) ? (-1.0, 1.0) : (-maximum_abs, maximum_abs)
-    end
-
     fig = Figure(size = (1500, 1050))
     panels = (
         ("UHP phase fraction", xci, uhp_fraction, :batlow, nothing),
         ("log₁₀ effective viscosity [Pa s]", xci, log10.(Array(stokes.viscosity.η)), :batlow, nothing),
         ("velocity magnitude [m s⁻¹]", xvi, velocity_magnitude, :viridis, nothing),
     )
-    if show_sensitivity
-        weak_viscosity_gradient = Array(@view gradients[:η].center[2, :, :])
-        panels = (
-            panels...,
-            ("∂J/∂η (weak-zone phase)", xci, weak_viscosity_gradient, :vik, symmetric_range(weak_viscosity_gradient)),
-        )
-    end
     for (panel, (title, coordinates, field, colormap, colorrange)) in enumerate(panels)
         row = fld(panel - 1, 2) + 1
         column = 2 * (mod(panel - 1, 2) + 1) - 1
@@ -341,13 +374,84 @@ function plot_dora_maira!(
         image = isnothing(colorrange) ?
                 heatmap!(axis, coordinates..., field; colormap) :
                 heatmap!(axis, coordinates..., field; colormap, colorrange)
-        lines!(axis, ellipse_x, ellipse_y; color = :white, linewidth = 3)
+        contour!(
+            axis, xci..., uhp_fraction;
+            levels = [0.5], color = :white, linewidth = 2,
+        )
         if panel == 1
             gravity_key!(axis, coordinates..., gravity)
         end
         Colorbar(fig[row, column + 1], image)
     end
-    save(joinpath(figdir, "dora_maira_$(step).png"), fig)
+    save(joinpath(figdir, "dora_maira_$(step).png"), fig; px_per_unit = 2)
+    save(joinpath(figdir, "dora_maira_$(step).pdf"), fig)
+    return nothing
+end
+
+@inline parameter_value(x) = hasproperty(x, :val) ? x.val : x
+
+function dora_maira_parameter_values(rheology)
+    return (
+        ρ = ntuple(
+            p -> parameter_value(rheology[p].Density[1].ρ), length(rheology)
+        ),
+        A = ntuple(
+            p -> parameter_value(rheology[p].CompositeRheology[1].elements[1].A),
+            length(rheology),
+        ),
+        n = ntuple(
+            p -> parameter_value(rheology[p].CompositeRheology[1].elements[1].n),
+            length(rheology),
+        ),
+    )
+end
+
+function symmetric_colorrange(field)
+    finite_values = filter(isfinite, vec(field))
+    maximum_abs = isempty(finite_values) ? 0.0 : maximum(abs, finite_values)
+    return iszero(maximum_abs) ? (-1.0, 1.0) : (-maximum_abs, maximum_abs)
+end
+
+function plot_dora_maira_sensitivities!(
+        figdir, step, grid, phase_ratios, gradients, rheology,
+    )
+    take(figdir)
+    xci = Array.(grid.xci) ./ 1e3
+    uhp_fraction = getindex.(JustPIC.CPUCellArray(phase_ratios.center), 3)
+    parameter_values = dora_maira_parameter_values(rheology)
+    phase_names = ("mantle", "weak zone", "UHP crust")
+    parameter_labels = (ρ = "ρ", A = "A", n = "n")
+
+    fig = Figure(size = (1650, 1450))
+    Label(
+        fig[0, 1:6],
+        "Relative sensitivity of mean UHP vertical velocity,  p ∂J/∂p";
+        fontsize = 24, font = :bold,
+    )
+    for (row, phase) in enumerate(eachindex(rheology))
+        for (column_index, parameter) in enumerate((:ρ, :A, :n))
+            field = Array(@view gradients[parameter].center[phase, :, :])
+            field .*= parameter_values[parameter][phase]
+            column = 2column_index - 1
+            axis = Axis(
+                fig[row, column]; aspect = DataAspect(),
+                title = "$(parameter_labels[parameter]) ∂J/∂$(parameter_labels[parameter])  —  $(phase_names[phase])",
+                xlabel = row == length(rheology) ? "x [km]" : "",
+                ylabel = column_index == 1 ? "y [km]" : "",
+            )
+            image = heatmap!(
+                axis, xci..., field; colormap = :vik,
+                colorrange = symmetric_colorrange(field),
+            )
+            contour!(
+                axis, xci..., uhp_fraction;
+                levels = [0.5], color = :black, linewidth = 1.5,
+            )
+            Colorbar(fig[row, column + 1], image; width = 14)
+        end
+    end
+    save(joinpath(figdir, "dora_maira_sensitivities_$(step).png"), fig; px_per_unit = 2)
+    save(joinpath(figdir, "dora_maira_sensitivities_$(step).pdf"), fig)
     return nothing
 end
 
@@ -355,18 +459,19 @@ end
     dora_maira_vertical_weak_zone(igg; kwargs...)
 
 Run a 2-D buoyancy-driven UHP exhumation model in a vertical central low-viscosity mantle shear
-zone. The final step can compute the adjoint sensitivity of the elliptical vertical-velocity
-observation to each phase's density and viscosity. `adjoint = false` skips that calculation.
+zone. At every plotted step, the adjoint computes the sensitivity of the current UHP body's
+mean vertical velocity to each phase's density, dislocation-creep prefactor `A`, and exponent
+`n`. `adjoint = false` skips those calculations.
 """
 function dora_maira_vertical_weak_zone(
         igg;
-        nx = 180,
-        ny = 213,
+        nx = 256,
+        ny = 512,
         lx = 55e3,
         nsteps = 100,
         figdir = "DoraMairaVerticalWeakZone",
         plot_results = true,
-        adjoint = false,
+        adjoint = true,
         verbose_PH = true,
         refined_grid = true,
         plot_every = 10,
@@ -391,7 +496,7 @@ function dora_maira_vertical_weak_zone(
     yv = refined_grid ?
          uhp_refined_vertical_vertices(ny, ly) :
          collect(range(-ly, 0.0; length = ny + 1))
-    grid = Geometry((xv, yv))
+    grid = Geometry(PTArray(backend), xv, yv)
     ni = grid.ni
     min_cell_widths = minimum.(grid.di.vertex)
     # GeoParams maps (gx, gz) to this 2-D model; gravity points top-right to bottom-left.
@@ -436,14 +541,15 @@ function dora_maira_vertical_weak_zone(
     update_halo!(@velocity(stokes)...)
 
     dyrel = DYREL(backend, stokes, rheology, phase_ratios, ϕ, grid.di, dt, γfact = 20.0; ϵ = 1e-4)
-    observation = (; field = :Vy, weights = ellipse_observation_weights(
-        stokes, grid, ellipse_center, ellipse_axes
-    ))
-    gradients = material_controls(backend, ni, (:ρ, :η); nphases = length(rheology))
+    observation = nothing
+    gradients = material_controls(backend, ni, (:ρ, :A, :n); nphases = length(rheology))
     output = nothing
 
     for step in 1:nsteps
-        final_adjoint_step = adjoint && step == nsteps
+        plot_step = plot_results && (step % plot_every == 0 || step == nsteps)
+        run_adjoint = adjoint && plot_step
+        # Rebuild the objective from the current phase ratios after particle advection.
+        run_adjoint && (observation = uhp_observation(phase_ratios, 3, stokes.V.Vy))
         # Continuation reaches the paper's 10¹⁶ Pa s lower bound from a well-conditioned
         # initial Stokes solve.  Only the final stage is used for the physical time step.
         cutoff_stages = step == 1 ? (
@@ -454,7 +560,7 @@ function dora_maira_vertical_weak_zone(
             args = (; T = temperature, P = stokes.P, dt)
             output = solve_VariationalDYREL!(
                 stokes,
-                final_adjoint_step && final_stage ? stokes_ad : nothing,
+                run_adjoint && final_stage ? stokes_ad : nothing,
                 ρg,
                 dyrel,
                 flow_bcs,
@@ -477,17 +583,17 @@ function dora_maira_vertical_weak_zone(
                 viscosity_cutoff = active_cutoff,
                 linear_viscosity = false,
                 air_phase = 0,
-                adjoint = final_adjoint_step && final_stage,
+                adjoint = run_adjoint && final_stage,
                 observation,
-                gradients = final_adjoint_step && final_stage ? gradients : (;),
+                gradients = run_adjoint && final_stage ? gradients : (;),
             )
             final_stage || copyto!(stokes.P0, stokes.P)
         end
 
-        if plot_results && (step % plot_every == 0 || step == nsteps)
-            plot_dora_maira!(
-                figdir, step, grid, phase_ratios, stokes, gradients, gravity, ellipse_center,
-                ellipse_axes; show_sensitivity = final_adjoint_step,
+        if plot_step
+            plot_dora_maira!(figdir, step, grid, phase_ratios, stokes, gravity)
+            run_adjoint && plot_dora_maira_sensitivities!(
+                figdir, step, grid, phase_ratios, gradients, rheology,
             )
         end
         step == nsteps && break
@@ -505,7 +611,9 @@ function dora_maira_vertical_weak_zone(
 end
 
 if !@isdefined(NO_AUTORUN)
-    ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
-    igg = IGG(init_global_grid(180, 213, 1; init_MPI = !JustRelax.MPI.Initialized())...)
-    Base.invokelatest(dora_maira_vertical_weak_zone, igg)
+    let nx = 256, ny = 512
+        ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
+        igg = IGG(init_global_grid(nx, ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
+        Base.invokelatest(dora_maira_vertical_weak_zone, igg; nx, ny)
+    end
 end
