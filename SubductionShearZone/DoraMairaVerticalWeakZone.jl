@@ -1,4 +1,7 @@
-const isCUDA = false
+using Pkg
+Pkg.activate(joinpath(@__DIR__, "Project.toml"))
+
+const isCUDA = true
 
 @static if isCUDA
     using CUDA
@@ -473,7 +476,7 @@ function dora_maira_vertical_weak_zone(
         plot_results = true,
         adjoint = true,
         verbose_PH = true,
-        refined_grid = true,
+        refined_grid = false,
         plot_every = 10,
     )
     # Schmalholz & Schenker (2016) reference geometry: 125 km × 110 km domain,
