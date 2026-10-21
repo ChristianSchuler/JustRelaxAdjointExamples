@@ -197,20 +197,21 @@ function uhp_observation(phase_ratios, uhp_phase, Vy)
     return (; field = :Vy, weights)
 end
 
-function poisson_vertical_vertices(ny, ly)
-    y_window = (0.0, 55.0)
+function poisson_horizontal_vertices(nx, lx, weak_zone_width)
+    x_window = (-weak_zone_width / 2, weak_zone_width / 2) ./ 1e3
     α_ref = 5.0
     κ_ref = 0.25
-    M = window_monitor(α_ref / 2, κ_ref * 2, 5 / 2, (y_window[2] + y_window[1]) / 2)
-    y_km = solve_grid(0, 55, M, ny)
-    # Map the 0–55 km monitor coordinate to the model's -ly–0 m depth coordinate.
-    return 2e3 .* y_km .- ly
+    M = window_monitor(
+        α_ref / 2, κ_ref * 2, (x_window[2] - x_window[1]) / 2, sum(x_window) / 2,
+    )
+    return solve_grid(-lx / 2e3, lx / 2e3, M, nx) .* 1e3
 end
 
-function plot_grid_spacing!(figdir, xv, yv, weak_half_width)
+function plot_grid_spacing!(figdir, grid, weak_half_width)
     take(figdir)
-    x, y = (xv[1:(end - 1)] .+ xv[2:end]) ./ 2e3, (yv[1:(end - 1)] .+ yv[2:end]) ./ 2e3
-    Δx, Δy = diff(xv) ./ 1e3, diff(yv) ./ 1e3
+    x, y = Array.(grid.xci) ./ 1e3
+    xv, yv = Array.(grid.xvi) ./ 1e3
+    Δx, Δy = Array.(grid.di.vertex) ./ 1e3
     fig = Figure(size = (900, 300))
     xaxis = Axis(
         fig[1, 1]; xlabel = "x [km]", ylabel = "Δx [km]",
@@ -223,156 +224,9 @@ function plot_grid_spacing!(figdir, xv, yv, weak_half_width)
     lines!(xaxis, x, Δx; color = :black, linewidth = 2)
     vlines!(xaxis, [-weak_half_width, weak_half_width] ./ 1e3; color = :crimson, linestyle = :dash)
     lines!(yaxis, y, Δy; color = :black, linewidth = 2)
+    xlims!(xaxis, extrema(xv))
+    xlims!(yaxis, extrema(yv))
     save(joinpath(figdir, "grid_spacing.png"), fig)
-    return nothing
-end
-
-function gravity_key!(axis, x, y, gravity)
-    gx, _, gz = compute_gravity(gravity)
-    # GeoParams stores components used in `-ρg`; the key shows physical acceleration.
-    gx, gz = -gx, -gz
-    xmin, xmax = extrema(x)
-    ymin, ymax = extrema(y)
-    xspan, yspan = xmax - xmin, ymax - ymin
-    # A compact, opaque legend keeps the vector and label readable over any phase colour.
-    # DataAspect() preserves the physical direction of the arrow.
-    magnitude = hypot(gx, gz)
-    iszero(magnitude) && return nothing
-    left, right = xmax - 0.49 * xspan, xmax - 0.04 * xspan
-    bottom, top = ymax - 0.15 * yspan, ymax - 0.035 * yspan
-    midy = (bottom + top) / 2
-    arrow_length = 0.12 * min(xspan, yspan)
-    dx, dy = arrow_length .* (gx, gz) ./ magnitude
-    midx = left + 0.10 * xspan
-
-    poly!(
-        axis,
-        Point2f[(left, bottom), (right, bottom), (right, top), (left, top)];
-        color = :white, strokecolor = :gray60, strokewidth = 0.7,
-    )
-    arrows2d!(
-        axis, [midx - dx / 2], [midy - dy / 2], [dx], [dy];
-        color = :black, shaftwidth = 2, tipwidth = 9, tiplength = 10,
-    )
-    labelx = left + 0.20 * xspan
-    text!(
-        axis, labelx, midy + 0.018 * yspan; text = "Gravity",
-        align = (:left, :center), color = :black, fontsize = 15, font = :bold,
-    )
-    text!(
-        axis, labelx, midy - 0.018 * yspan;
-        text = "$(round(magnitude; digits = 2)) m s⁻²",
-        align = (:left, :center), color = :gray25, fontsize = 12,
-    )
-    return nothing
-end
-
-function plot_dora_maira!(
-        figdir, step, grid, phase_ratios, stokes, gravity,
-    )
-    take(figdir)
-    Vx, Vy = @velocity(stokes)
-    Vx_v, Vy_v = @zeros(size(stokes.P) .+ 1...), @zeros(size(stokes.P) .+ 1...)
-    velocity2vertex!(Vx_v, Vy_v, Vx, Vy)
-
-    xci, xvi = Array.(grid.xci) ./ 1e3, Array.(grid.xvi) ./ 1e3
-    # Transfer the backing storage first; Array(::CellArray) otherwise scalar-indexes it.
-    uhp_fraction = getindex.(JustPIC.CPUCellArray(phase_ratios.center), 3)
-    velocity_magnitude = hypot.(Array(Vx_v), Array(Vy_v))
-    fig = Figure(size = (1500, 1050))
-    panels = (
-        ("UHP phase fraction", xci, uhp_fraction, :batlow, nothing),
-        ("log₁₀ effective viscosity [Pa s]", xci, log10.(Array(stokes.viscosity.η)), :batlow, nothing),
-        ("velocity magnitude [m s⁻¹]", xvi, velocity_magnitude, :viridis, nothing),
-    )
-    for (panel, (title, coordinates, field, colormap, colorrange)) in enumerate(panels)
-        row = fld(panel - 1, 2) + 1
-        column = 2 * (mod(panel - 1, 2) + 1) - 1
-        axis = Axis(
-            fig[row, column];
-            aspect = DataAspect(), title, xlabel = "x [km]", ylabel = column == 1 ? "y [km]" : "",
-        )
-        image = isnothing(colorrange) ?
-                heatmap!(axis, coordinates..., field; colormap) :
-                heatmap!(axis, coordinates..., field; colormap, colorrange)
-        contour!(
-            axis, xci..., uhp_fraction;
-            levels = [0.5], color = :white, linewidth = 2,
-        )
-        if panel == 1
-            gravity_key!(axis, coordinates..., gravity)
-        end
-        Colorbar(fig[row, column + 1], image)
-    end
-    save(joinpath(figdir, "dora_maira_$(step).png"), fig; px_per_unit = 2)
-    save(joinpath(figdir, "dora_maira_$(step).pdf"), fig)
-    return nothing
-end
-
-@inline parameter_value(x) = hasproperty(x, :val) ? x.val : x
-
-function dora_maira_parameter_values(rheology)
-    return (
-        ρ = ntuple(
-            p -> parameter_value(rheology[p].Density[1].ρ), length(rheology)
-        ),
-        A = ntuple(
-            p -> parameter_value(rheology[p].CompositeRheology[1].elements[1].A),
-            length(rheology),
-        ),
-        n = ntuple(
-            p -> parameter_value(rheology[p].CompositeRheology[1].elements[1].n),
-            length(rheology),
-        ),
-    )
-end
-
-function symmetric_colorrange(field)
-    finite_values = filter(isfinite, vec(field))
-    maximum_abs = isempty(finite_values) ? 0.0 : maximum(abs, finite_values)
-    return iszero(maximum_abs) ? (-1.0, 1.0) : (-maximum_abs, maximum_abs)
-end
-
-function plot_dora_maira_sensitivities!(
-        figdir, step, grid, phase_ratios, gradients, rheology,
-    )
-    take(figdir)
-    xci = Array.(grid.xci) ./ 1e3
-    uhp_fraction = getindex.(JustPIC.CPUCellArray(phase_ratios.center), 3)
-    parameter_values = dora_maira_parameter_values(rheology)
-    phase_names = ("mantle", "weak zone", "UHP crust")
-    parameter_labels = (ρ = "ρ", A = "A", n = "n")
-
-    fig = Figure(size = (1650, 1450))
-    Label(
-        fig[0, 1:6],
-        "Relative sensitivity of mean UHP vertical velocity,  p ∂J/∂p";
-        fontsize = 24, font = :bold,
-    )
-    for (row, phase) in enumerate(eachindex(rheology))
-        for (column_index, parameter) in enumerate((:ρ, :A, :n))
-            field = Array(@view gradients[parameter].center[phase, :, :])
-            field .*= parameter_values[parameter][phase]
-            column = 2column_index - 1
-            axis = Axis(
-                fig[row, column]; aspect = DataAspect(),
-                title = "$(parameter_labels[parameter]) ∂J/∂$(parameter_labels[parameter])  —  $(phase_names[phase])",
-                xlabel = row == length(rheology) ? "x [km]" : "",
-                ylabel = column_index == 1 ? "y [km]" : "",
-            )
-            image = heatmap!(
-                axis, xci..., field; colormap = :vik,
-                colorrange = symmetric_colorrange(field),
-            )
-            contour!(
-                axis, xci..., uhp_fraction;
-                levels = [0.5], color = :black, linewidth = 1.5,
-            )
-            Colorbar(fig[row, column + 1], image; width = 14)
-        end
-    end
-    save(joinpath(figdir, "dora_maira_sensitivities_$(step).png"), fig; px_per_unit = 2)
-    save(joinpath(figdir, "dora_maira_sensitivities_$(step).pdf"), fig)
     return nothing
 end
 
@@ -380,9 +234,9 @@ end
     dora_maira_vertical_weak_zone(igg; kwargs...)
 
 Run a 2-D buoyancy-driven UHP exhumation model in a vertical central low-viscosity mantle shear
-zone. At every plotted step, the adjoint computes the sensitivity of the current UHP body's
-mean vertical velocity to each phase's density, dislocation-creep prefactor `A`, and exponent
-`n`. `adjoint = false` skips those calculations.
+zone. At the requested cadence, the adjoint computes the sensitivity of the current UHP body's
+mean vertical velocity to each phase's density, dislocation-creep prefactor `A`, and exponent `n`.
+`adjoint = false` skips those calculations.
 """
 function dora_maira_vertical_weak_zone(
         igg;
@@ -391,10 +245,9 @@ function dora_maira_vertical_weak_zone(
         lx = 55e3,
         nsteps = 100,
         figdir = "DoraMairaVerticalWeakZone",
-        plot_results = true,
         adjoint = true,
         verbose_PH = true,
-        plot_every = 10,
+        adjoint_every = 10,
     )
     # Schmalholz & Schenker (2016) reference geometry: 125 km × 110 km domain,
     # 5 km-thick weak layer, and a 20 km × 3 km UHP ellipse. The default 55 km width is
@@ -405,9 +258,9 @@ function dora_maira_vertical_weak_zone(
     ly = 110e3
     weak_zone_width = 5e3
     lx > weak_zone_width || throw(ArgumentError("lx must exceed the 5 km weak-zone width"))
-    plot_every ≥ 1 || throw(ArgumentError("plot_every must be at least one step"))
-    xv = collect(range(-lx / 2, lx / 2; length = nx + 1))
-    yv = poisson_vertical_vertices(ny, ly)
+    adjoint_every ≥ 1 || throw(ArgumentError("adjoint_every must be at least one step"))
+    xv = poisson_horizontal_vertices(nx, lx, weak_zone_width)
+    yv = collect(range(-ly, 0.0; length = ny + 1))
     grid = Geometry(PTArray(backend), xv, yv)
     ni = grid.ni
     min_cell_widths = minimum.(grid.di.vertex)
@@ -416,9 +269,7 @@ function dora_maira_vertical_weak_zone(
     rheology = dora_maira_rheology(; gravity)
     weak_half_width = weak_zone_width / 2
     ellipse_center, ellipse_axes = (0.0, -98e3), (1.5e3, 10e3)
-    if plot_results
-        plot_grid_spacing!(figdir, xv, yv, weak_half_width)
-    end
+    plot_grid_spacing!(figdir, grid, weak_half_width)
 
     particles = init_particles(particle_backend, 30, 40, 12, grid.xi_vel...)
     pPhases, = init_cell_arrays(particles, Val(1))
@@ -442,7 +293,6 @@ function dora_maira_vertical_weak_zone(
     dt = 1.0e11
     args = (; T = temperature, P = stokes.P, dt)
     viscosity_cutoff = 1e16, 1e22
-    # viscosity_cutoff = 1e18, 1e22
     compute_ρg!(ρg, phase_ratios, rheology, args)
     initialize_dora_maira_pressure!(stokes.P, grid, gravity)
     stokes.P0 .= stokes.P
@@ -457,8 +307,7 @@ function dora_maira_vertical_weak_zone(
     output = nothing
 
     for step in 1:nsteps
-        plot_step = plot_results && (step % plot_every == 0 || step == nsteps)
-        run_adjoint = adjoint && plot_step
+        run_adjoint = adjoint && (step % adjoint_every == 0 || step == nsteps)
         # Rebuild the objective from the current phase ratios after particle advection.
         run_adjoint && (observation = uhp_observation(phase_ratios, 3, stokes.V.Vy))
         # Continuation reaches the paper's 10¹⁶ Pa s lower bound from a well-conditioned
@@ -487,8 +336,6 @@ function dora_maira_vertical_weak_zone(
                 iterMax = 50_000,
                 total_iterMax = 200_000,
                 nout = 10,
-                # A 10% inner reduction is sufficient before each nonlinear PH update;
-                # forcing 1% here exhausts the inner budget on the 100 m weak-zone grid.
                 rel_drop = 1e-1,
                 viscosity_relaxation = 1.0e-2,
                 viscosity_cutoff = active_cutoff,
@@ -501,15 +348,8 @@ function dora_maira_vertical_weak_zone(
             final_stage || copyto!(stokes.P0, stokes.P)
         end
 
-        if plot_step
-            plot_dora_maira!(figdir, step, grid, phase_ratios, stokes, gravity)
-            run_adjoint && plot_dora_maira_sensitivities!(
-                figdir, step, grid, phase_ratios, gradients, rheology,
-            )
-        end
         step == nsteps && break
 
-        # dt = 0.4 * compute_dt(stokes, min_cell_widths, igg)
         dt = compute_dt(stokes, min_cell_widths, igg)
         advection_MQS!(particles, RungeKutta4(), @velocity(stokes), dt)
         move_particles!(particles, (pPhases,))
@@ -522,7 +362,7 @@ function dora_maira_vertical_weak_zone(
 end
 
 if !@isdefined(NO_AUTORUN)
-    let nx = 256, ny = 250
+    let nx = 128, ny = 128
         ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
         igg = IGG(init_global_grid(nx, ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
         Base.invokelatest(dora_maira_vertical_weak_zone, igg; nx, ny)
