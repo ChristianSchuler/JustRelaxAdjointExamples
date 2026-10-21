@@ -1,7 +1,7 @@
 using Pkg
-Pkg.activate(joinpath(@__DIR__, "Project.toml"))
+Pkg.activate(joinpath(@__DIR__, ".."))
 
-const isCUDA = true
+const isCUDA = false
 
 @static if isCUDA
     using CUDA
@@ -11,7 +11,8 @@ end
 using JustRelax, JustRelax.JustRelax2D
 using JustPIC
 using GeoParams
-using CairoMakie
+using PoissonGrids
+using GLMakie
 using ParallelStencil, ParallelStencil.FiniteDifferences2D
 
 const backend = @static if isCUDA
@@ -196,116 +197,33 @@ function uhp_observation(phase_ratios, uhp_phase, Vy)
     return (; field = :Vy, weights)
 end
 
-function center_refined_vertices(nx, lx; weak_width = 5e3, weak_spacing = 100.0)
-    nweak = round(Int, weak_width / weak_spacing)
-    nside_total = nx - nweak
-    nside_total ≥ 0 && iseven(nside_total) || throw(ArgumentError(
-        "nx must exceed the weak-zone cell count by an even number"
-    ))
-    nside = nside_total ÷ 2
-    side_length = (lx - weak_width) / 2
-    side_length ≥ nside * weak_spacing || throw(ArgumentError(
-        "nx is too large for the requested weak-zone spacing"
-    ))
-
-    # Geometrically increase the cell widths away from the uniformly resolved weak zone.
-    side_sum(r) = isone(r) ? nside : (r^nside - 1) / (r - 1)
-    target = side_length / weak_spacing
-    lo, hi = 1.0, 2.0
-    while side_sum(hi) < target
-        hi *= 2
-    end
-    for _ in 1:80
-        r = (lo + hi) / 2
-        side_sum(r) < target ? (lo = r) : (hi = r)
-    end
-    outward_widths = weak_spacing .* ((lo + hi) / 2) .^ (0:(nside - 1))
-    @assert isapprox(sum(outward_widths), side_length; rtol = 1e-12)
-
-    left = -weak_width / 2 .- reverse(cumsum(outward_widths))
-    weak_zone = collect(range(-weak_width / 2, weak_width / 2; length = nweak + 1))
-    right = weak_width / 2 .+ cumsum(outward_widths)
-    vertices = vcat(left, weak_zone, right)
-    vertices[1], vertices[end] = -lx / 2, lx / 2
-    return vertices
+function poisson_vertical_vertices(ny, ly)
+    y_window = (0.0, 55.0)
+    α_ref = 5.0
+    κ_ref = 0.25
+    M = window_monitor(α_ref / 2, κ_ref * 2, 5 / 2, (y_window[2] + y_window[1]) / 2)
+    y_km = solve_grid(0, 55, M, ny)
+    # Map the 0–55 km monitor coordinate to the model's -ly–0 m depth coordinate.
+    return 2e3 .* y_km .- ly
 end
 
-function uhp_refined_vertical_vertices(
-        ny, ly; refined_top = -80e3, fine_spacing = 250.0, coarse_spacing = 1e3,
-        growth = 1.05,
-    )
-    -ly < refined_top < 0 || throw(ArgumentError("refined_top must lie inside the domain"))
-    fine_height = refined_top + ly
-    nfine = round(Int, fine_height / fine_spacing)
-    isapprox(nfine * fine_spacing, fine_height; rtol = 1e-12) || throw(ArgumentError(
-        "the fine vertical band must be an integer number of fine cells"
-    ))
-    ntransition = ceil(Int, log(coarse_spacing / fine_spacing) / log(growth))
-    transition_widths = fine_spacing .* growth .^ (0:(ntransition - 1))
-    remaining_height = -refined_top - sum(transition_widths)
-    ncoarse = round(Int, remaining_height / coarse_spacing)
-    ncoarse > 0 || throw(ArgumentError("vertical domain is too short for the requested refinement"))
-    coarse_spacing_actual = remaining_height / ncoarse
-    coarse_spacing_actual ≤ growth * last(transition_widths) || throw(ArgumentError(
-        "ny is incompatible with the requested smooth vertical refinement"
-    ))
-
-    widths = vcat(
-        fill(fine_spacing, nfine), transition_widths, fill(coarse_spacing_actual, ncoarse),
-    )
-    length(widths) == ny || throw(ArgumentError(
-        "this vertical refinement has $(length(widths)) cells; set ny = $(length(widths))"
-    ))
-    vertices = -ly .+ vcat(0.0, cumsum(widths))
-    vertices[end] = 0.0
-    return vertices
-end
-
-function plot_grid_refinement!(figdir, xv, yv, weak_half_width; refined_grid = true)
+function plot_grid_spacing!(figdir, xv, yv, weak_half_width)
     take(figdir)
     x, y = (xv[1:(end - 1)] .+ xv[2:end]) ./ 2e3, (yv[1:(end - 1)] .+ yv[2:end]) ./ 2e3
     Δx, Δy = diff(xv) ./ 1e3, diff(yv) ./ 1e3
     fig = Figure(size = (900, 300))
     xaxis = Axis(
         fig[1, 1]; xlabel = "x [km]", ylabel = "Δx [km]",
-        title = refined_grid ? "Horizontal grid refinement" : "Uniform horizontal grid",
+        title = "Horizontal grid spacing",
     )
     yaxis = Axis(
         fig[1, 2]; xlabel = "y [km]", ylabel = "Δy [km]",
-        title = refined_grid ? "Vertical grid refinement" : "Uniform vertical grid",
+        title = "Vertical grid spacing",
     )
     lines!(xaxis, x, Δx; color = :black, linewidth = 2)
     vlines!(xaxis, [-weak_half_width, weak_half_width] ./ 1e3; color = :crimson, linestyle = :dash)
     lines!(yaxis, y, Δy; color = :black, linewidth = 2)
-    refined_grid && vlines!(yaxis, [-110.0, -80.0]; color = :crimson, linestyle = :dash)
-    save(joinpath(figdir, "grid_refinement.png"), fig)
-    return nothing
-end
-
-function plot_initial_grid!(figdir, xv, yv, weak_half_width, ellipse_center, ellipse_axes)
-    take(figdir)
-    x, y = xv ./ 1e3, yv ./ 1e3
-    θ = range(0, 2π; length = 129)
-    ellipse_x = ellipse_center[1] / 1e3 .+ ellipse_axes[1] / 1e3 .* cos.(θ)
-    ellipse_y = ellipse_center[2] / 1e3 .+ ellipse_axes[2] / 1e3 .* sin.(θ)
-    fig = Figure(size = (900, 750))
-    axis = Axis(
-        fig[1, 1]; aspect = DataAspect(), xlabel = "x [km]", ylabel = "y [km]",
-        title = "Initial computational grid",
-    )
-    poly!(
-        axis,
-        Point2f[
-            (-weak_half_width / 1e3, minimum(y)), (weak_half_width / 1e3, minimum(y)),
-            (weak_half_width / 1e3, maximum(y)), (-weak_half_width / 1e3, maximum(y)),
-        ]; color = (:orange, 0.18), strokewidth = 0,
-    )
-    vlines!(axis, x; color = (:black, 0.35), linewidth = 0.6)
-    hlines!(axis, y; color = (:black, 0.35), linewidth = 0.6)
-    vlines!(axis, [-weak_half_width, weak_half_width] ./ 1e3; color = :crimson, linewidth = 2)
-    lines!(axis, ellipse_x, ellipse_y; color = :dodgerblue, linewidth = 3)
-    text!(axis, 0.0, -8.0; text = "weak zone", align = (:center, :top), color = :crimson, fontsize = 18)
-    save(joinpath(figdir, "initial_grid.png"), fig)
+    save(joinpath(figdir, "grid_spacing.png"), fig)
     return nothing
 end
 
@@ -469,36 +387,27 @@ mean vertical velocity to each phase's density, dislocation-creep prefactor `A`,
 function dora_maira_vertical_weak_zone(
         igg;
         nx = 256,
-        ny = 512,
+        ny = 250,
         lx = 55e3,
         nsteps = 100,
         figdir = "DoraMairaVerticalWeakZone",
         plot_results = true,
         adjoint = true,
         verbose_PH = true,
-        refined_grid = false,
         plot_every = 10,
     )
     # Schmalholz & Schenker (2016) reference geometry: 125 km × 110 km domain,
     # 5 km-thick weak layer, and a 20 km × 3 km UHP ellipse. The default 55 km width is
     # a compact exploratory domain; use `lx = 125e3` for the paper-domain width.
     igg.nprocs == 1 || throw(ArgumentError(
-        "the refined Dora Maira grid currently supports one MPI rank"
+        "the Dora Maira grid currently supports one MPI rank"
     ))
     ly = 110e3
     weak_zone_width = 5e3
-    weak_zone_spacing = 100.0
     lx > weak_zone_width || throw(ArgumentError("lx must exceed the 5 km weak-zone width"))
     plot_every ≥ 1 || throw(ArgumentError("plot_every must be at least one step"))
-    # The production grid resolves the 5 km channel at 100 m, grades symmetrically outward,
-    # and vertically refines the UHP ellipse's depth range. Set `refined_grid = false` for
-    # a uniform grid using the requested nx and ny.
-    xv = refined_grid ?
-         center_refined_vertices(nx, lx; weak_width = weak_zone_width, weak_spacing = weak_zone_spacing) :
-         collect(range(-lx / 2, lx / 2; length = nx + 1))
-    yv = refined_grid ?
-         uhp_refined_vertical_vertices(ny, ly) :
-         collect(range(-ly, 0.0; length = ny + 1))
+    xv = collect(range(-lx / 2, lx / 2; length = nx + 1))
+    yv = poisson_vertical_vertices(ny, ly)
     grid = Geometry(PTArray(backend), xv, yv)
     ni = grid.ni
     min_cell_widths = minimum.(grid.di.vertex)
@@ -508,8 +417,7 @@ function dora_maira_vertical_weak_zone(
     weak_half_width = weak_zone_width / 2
     ellipse_center, ellipse_axes = (0.0, -98e3), (1.5e3, 10e3)
     if plot_results
-        plot_grid_refinement!(figdir, xv, yv, weak_half_width; refined_grid)
-        plot_initial_grid!(figdir, xv, yv, weak_half_width, ellipse_center, ellipse_axes)
+        plot_grid_spacing!(figdir, xv, yv, weak_half_width)
     end
 
     particles = init_particles(particle_backend, 30, 40, 12, grid.xi_vel...)
@@ -614,7 +522,7 @@ function dora_maira_vertical_weak_zone(
 end
 
 if !@isdefined(NO_AUTORUN)
-    let nx = 256, ny = 512
+    let nx = 256, ny = 250
         ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
         igg = IGG(init_global_grid(nx, ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
         Base.invokelatest(dora_maira_vertical_weak_zone, igg; nx, ny)
