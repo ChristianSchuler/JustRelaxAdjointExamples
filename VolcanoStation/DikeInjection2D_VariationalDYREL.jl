@@ -205,21 +205,6 @@ function observation_indicator(stokes_ad, grid, observation)
     return box
 end
 
-"""Write a Vy-grid 0/1 box as text, surface row first, with node coordinates in the margins."""
-function write_observation_box(filename, box, grid)
-    mkpath(dirname(filename))
-    x = centers_with_ghosts(grid.xci[1])
-    y = Array(grid.xvi[2])
-    open(filename, "w") do io
-        println(io, "# Vy nodes in the objective box (1) and outside (0); rows: y [m], columns: x [m]")
-        println(io, "y\\x ", join(round.(Int, x), ' '))
-        for j in reverse(axes(box, 2))
-            println(io, round(Int, y[j]), ' ', join(box[:, j], ' '))
-        end
-    end
-    return nothing
-end
-
 """Return DPCap failure codes: 0 = no failure, 1 = tensile cap, 2 = Drucker-Prager shear."""
 function dpcap_failure_modes(stokes, phase_ratios, rheology)
     failure_mode = similar(stokes.P, Int8)
@@ -408,7 +393,6 @@ function dike_injection_variational_dyrel(
     observation = (; field = :Vy, center = (dike_top[1], (box_bottom + box_top) / 2),
         half_width = (dike_width / 2, (box_top - box_bottom) / 2 + 1.0e-6 * dy))
     observation_box = observation_indicator(stokes_ad, grid, observation)
-    write_observation_box(joinpath(vtk_dir, "observation_box.txt"), observation_box, grid)
     gradients = adjoint ? material_controls(
         backend, ni, (:ρ0, :η, :Kb); nphases = length(rheology),
     ) : (;)
