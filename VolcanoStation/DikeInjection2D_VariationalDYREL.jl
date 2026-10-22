@@ -476,5 +476,5 @@ end
 # if abspath(PROGRAM_FILE) == @__FILE__
     ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
     igg = IGG(init_global_grid(128*1, 128*1, 1; init_MPI = !JustRelax.MPI.Initialized())...)
-    @time dike_injection_variational_dyrel(igg)
+    @time Base.invokelatest(dike_injection_variational_dyrel, igg)
 # end
