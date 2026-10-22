@@ -254,13 +254,10 @@ function save_dike_vtk!(
         data_c = (
             ; data_c...,
             adjoint_pressure = Array(stokes_ad.λP),
-            # per unit area: the per-cell gradients scale with the non-uniform cell area
-            gradient_ρ0_crust_per_area = Array(@view gradients.ρ0.per_area[1, :, :]),
-            gradient_ρ0_magma_per_area = Array(@view gradients.ρ0.per_area[2, :, :]),
-            gradient_η_crust_per_area = Array(@view gradients.η.per_area[1, :, :]),
-            gradient_η_magma_per_area = Array(@view gradients.η.per_area[2, :, :]),
-            gradient_Kb_crust_per_area = Array(@view gradients.Kb.per_area[1, :, :]),
-            gradient_Kb_magma_per_area = Array(@view gradients.Kb.per_area[2, :, :]),
+            # Sum phase contributions; per-area normalization accounts for nonuniform cells.
+            gradient_ρ0_per_area = dropdims(sum(Array(gradients.ρ0.per_area); dims = 1); dims = 1),
+            gradient_η_per_area = dropdims(sum(Array(gradients.η.per_area); dims = 1); dims = 1),
+            gradient_Kb_per_area = dropdims(sum(Array(gradients.Kb.per_area); dims = 1); dims = 1),
         )
     end
     filename = joinpath(vtk_dir, "dike_injection_" * lpad(step, 6, '0'))
@@ -288,7 +285,7 @@ function dike_injection_variational_dyrel(
         nx = 320,
         ny = 176,
         nsteps = 200,
-        nout = 2,
+        nout = 10,
         dt = year,
         Q_dike = 1.0e-4,
         strain_rate = 1.0e-30,
