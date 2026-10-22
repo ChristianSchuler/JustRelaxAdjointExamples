@@ -254,12 +254,13 @@ function save_dike_vtk!(
         data_c = (
             ; data_c...,
             adjoint_pressure = Array(stokes_ad.λP),
-            gradient_ρ0_crust = Array(@view gradients.ρ0.center[1, :, :]),
-            gradient_ρ0_magma = Array(@view gradients.ρ0.center[2, :, :]),
-            gradient_η_crust = Array(@view gradients.η.center[1, :, :]),
-            gradient_η_magma = Array(@view gradients.η.center[2, :, :]),
-            gradient_Kb_crust = Array(@view gradients.Kb.center[1, :, :]),
-            gradient_Kb_magma = Array(@view gradients.Kb.center[2, :, :]),
+            # per unit area: the per-cell gradients scale with the non-uniform cell area
+            gradient_ρ0_crust_per_area = Array(@view gradients.ρ0.per_area[1, :, :]),
+            gradient_ρ0_magma_per_area = Array(@view gradients.ρ0.per_area[2, :, :]),
+            gradient_η_crust_per_area = Array(@view gradients.η.per_area[1, :, :]),
+            gradient_η_magma_per_area = Array(@view gradients.η.per_area[2, :, :]),
+            gradient_Kb_crust_per_area = Array(@view gradients.Kb.per_area[1, :, :]),
+            gradient_Kb_magma_per_area = Array(@view gradients.Kb.per_area[2, :, :]),
         )
     end
     filename = joinpath(vtk_dir, "dike_injection_" * lpad(step, 6, '0'))
