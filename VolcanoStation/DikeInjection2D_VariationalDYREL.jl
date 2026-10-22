@@ -16,7 +16,7 @@ original FEM model's thermal diffusion and station-network optimisation are not 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
-const isCUDA = false
+const isCUDA = true
 
 @static if isCUDA
     using CUDA
@@ -302,7 +302,7 @@ function dike_injection_variational_dyrel(
         nx = 320,
         ny = 176,
         nsteps = 200,
-        nout = 10,
+        nout = 2,
         dt = year,
         Q_dike = 1.0e-4,
         strain_rate = 1.0e-30,
@@ -354,7 +354,8 @@ function dike_injection_variational_dyrel(
     ϕ = RockRatio(backend, ni)
     chain = init_markerchain(particle_backend, 100, 15, 200, grid.xvi[1], air_top)
     compute_rock_fraction!(ϕ, chain, grid.xvi, grid.di.vertex)
-    grid_vxi = velocity_grids(grid.xci, grid.xvi, grid.di.center)
+    # Geometry already builds staggered coordinates before transferring them to the backend.
+    grid_vxi = grid.xi_vel
     flow_bcs = VelocityBoundaryConditions(; free_slip = (left = true, right = true, top = true, bot = true))
     stokes = StokesArrays(backend, ni, flow_bcs)
     stokes_ad = AdjointStokesArrays(backend, ni, flow_bcs)

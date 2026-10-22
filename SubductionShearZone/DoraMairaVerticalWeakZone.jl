@@ -12,8 +12,10 @@ using JustRelax, JustRelax.JustRelax2D
 using JustPIC
 using GeoParams
 using PoissonGrids
-using GLMakie
+using CairoMakie
 using ParallelStencil, ParallelStencil.FiniteDifferences2D
+
+CairoMakie.activate!()
 
 const backend = @static if isCUDA
     JustRelax.CUDABackend
@@ -208,7 +210,7 @@ function poisson_horizontal_vertices(nx, lx, weak_zone_width)
 end
 
 function plot_grid_spacing!(figdir, grid, weak_half_width)
-    take(figdir)
+    mkpath(figdir)
     x, y = Array.(grid.xci) ./ 1e3
     xv, yv = Array.(grid.xvi) ./ 1e3
     Δx, Δy = Array.(grid.di.vertex) ./ 1e3
