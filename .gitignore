@@ -4,3 +4,8 @@ Manifest.toml
 *.e
 *.o
 *.slm
+*.vtr
+*.pvd
+*.vtp
+*.DS_Store
+*.pvsm
