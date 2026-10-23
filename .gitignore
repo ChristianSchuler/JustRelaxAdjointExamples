@@ -8,5 +8,6 @@ Manifest.toml
 *.pvd
 *.vtp
 *.vts
+*.vti
 *.DS_Store
 *.pvsm
