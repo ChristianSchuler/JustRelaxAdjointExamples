@@ -254,13 +254,10 @@ function save_dike_vtk!(
         data_c = (
             ; data_c...,
             adjoint_pressure = Array(stokes_ad.λP),
-            # per unit area: the per-cell gradients scale with the non-uniform cell area
-            gradient_ρ0_crust_per_area = Array(@view gradients.ρ0.per_area[1, :, :]),
-            gradient_ρ0_magma_per_area = Array(@view gradients.ρ0.per_area[2, :, :]),
-            gradient_η_crust_per_area = Array(@view gradients.η.per_area[1, :, :]),
-            gradient_η_magma_per_area = Array(@view gradients.η.per_area[2, :, :]),
-            gradient_Kb_crust_per_area = Array(@view gradients.Kb.per_area[1, :, :]),
-            gradient_Kb_magma_per_area = Array(@view gradients.Kb.per_area[2, :, :]),
+            # Sum phase contributions; per-area normalization accounts for nonuniform cells.
+            gradient_ρ0_per_area = dropdims(sum(Array(gradients.ρ0.per_area); dims = 1); dims = 1),
+            gradient_η_per_area = dropdims(sum(Array(gradients.η.per_area); dims = 1); dims = 1),
+            gradient_Kb_per_area = dropdims(sum(Array(gradients.Kb.per_area); dims = 1); dims = 1),
         )
     end
     filename = joinpath(vtk_dir, "dike_injection_" * lpad(step, 6, '0'))
@@ -477,5 +474,5 @@ end
 # if abspath(PROGRAM_FILE) == @__FILE__
     ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
     igg = IGG(init_global_grid(128*1, 128*1, 1; init_MPI = !JustRelax.MPI.Initialized())...)
-    @time dike_injection_variational_dyrel(igg)
+    @time Base.invokelatest(dike_injection_variational_dyrel, igg)
 # end
