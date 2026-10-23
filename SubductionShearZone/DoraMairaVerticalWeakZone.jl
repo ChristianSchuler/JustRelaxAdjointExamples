@@ -8,7 +8,7 @@ const isCUDA = false
     CUDA.allowscalar(false)
 end
 
-using JustRelax, JustRelax.JustRelax2D
+using JustRelax, JustRelax.JustRelax2D, JustRelax.DataIO
 using JustPIC
 using GeoParams
 using PoissonGrids
@@ -28,6 +28,8 @@ const particle_backend = @static if isCUDA
 else
     JustPIC.CPU
 end
+
+const year = 365.25 * 24 * 3600.0
 
 @static if isCUDA
     @init_parallel_stencil(CUDA, Float64, 2)
@@ -232,24 +234,86 @@ function plot_grid_spacing!(figdir, grid, weak_half_width)
     return nothing
 end
 
+function save_dora_maira_vtk!(
+        vtk_dir, step, time, grid, stokes, ρg, phase_ratios, temperature, gravity;
+        observation = nothing, stokes_ad = nothing, gradients = nothing,
+    )
+    mkpath(vtk_dir)
+    time_Myr = time / (1.0e6 * year)
+    Vx_v = @zeros(grid.ni .+ 1...)
+    Vy_v = @zeros(grid.ni .+ 1...)
+    velocity2vertex!(Vx_v, Vy_v, @velocity(stokes)...)
+    data_v = (; Vx = Array(Vx_v), Vy = Array(Vy_v))
+    phase_center = Array(phase_ratios.center)
+    g = hypot(compute_gravity(gravity)...)
+    data_c = (
+        ; pressure = Array(stokes.P),
+        viscosity = Array(stokes.viscosity.η),
+        effective_viscosity = Array(stokes.viscosity.η_vep),
+        density = hypot.(Array(ρg[1]), Array(ρg[2])) ./ g,
+        temperature = Array(@view temperature[2:(end - 1), 2:(end - 1)]),
+        stress_invariant = Array(stokes.τ.II),
+        strain_rate_invariant = Array(stokes.ε.II),
+        mantle_fraction = getindex.(phase_center, 1),
+        weak_zone_fraction = getindex.(phase_center, 2),
+        uhp_fraction = getindex.(phase_center, 3),
+    )
+    if !isnothing(stokes_ad)
+        adjoint_Vx_v = @zeros(grid.ni .+ 1...)
+        adjoint_Vy_v = @zeros(grid.ni .+ 1...)
+        # stokes_ad.V and stokes_ad.P hold the adjoint residuals; λV and λP are the adjoint fields
+        velocity2vertex!(adjoint_Vx_v, adjoint_Vy_v, stokes_ad.λV.Vx, stokes_ad.λV.Vy)
+        data_v = (; data_v..., adjoint_Vx = Array(adjoint_Vx_v), adjoint_Vy = Array(adjoint_Vy_v))
+        # cell value: mean weight of the Vy nodes on its bottom and top faces
+        weights = Array(observation.weights)
+        data_c = (
+            ; data_c...,
+            observation_weight = (weights[2:(end - 1), 1:(end - 1)] .+ weights[2:(end - 1), 2:end]) ./ 2,
+            adjoint_pressure = Array(stokes_ad.λP),
+            # per unit area: the per-cell gradients scale with the non-uniform cell area
+            gradient_ρ_mantle_per_area = Array(@view gradients.ρ.per_area[1, :, :]),
+            gradient_ρ_weak_zone_per_area = Array(@view gradients.ρ.per_area[2, :, :]),
+            gradient_ρ_uhp_per_area = Array(@view gradients.ρ.per_area[3, :, :]),
+            gradient_A_mantle_per_area = Array(@view gradients.A.per_area[1, :, :]),
+            gradient_A_weak_zone_per_area = Array(@view gradients.A.per_area[2, :, :]),
+            gradient_A_uhp_per_area = Array(@view gradients.A.per_area[3, :, :]),
+            gradient_n_mantle_per_area = Array(@view gradients.n.per_area[1, :, :]),
+            gradient_n_weak_zone_per_area = Array(@view gradients.n.per_area[2, :, :]),
+            gradient_n_uhp_per_area = Array(@view gradients.n.per_area[3, :, :]),
+        )
+    end
+    filename = joinpath(vtk_dir, "dora_maira_" * lpad(step, 6, '0'))
+    save_vtk(
+        filename, grid.xvi, grid.xci, data_v, data_c, (Array(Vx_v), Array(Vy_v));
+        t = time_Myr, pvd = joinpath(vtk_dir, "dora_maira"),
+    )
+    return nothing
+end
+
 """
     dora_maira_vertical_weak_zone(igg; kwargs...)
 
 Run a 2-D buoyancy-driven UHP exhumation model in a vertical central low-viscosity mantle shear
-zone. At the requested cadence, the adjoint computes the sensitivity of the current UHP body's
-mean vertical velocity to each phase's density, dislocation-creep prefactor `A`, and exponent `n`.
-`adjoint = false` skips those calculations.
+zone. Every `nout` steps and on the final step, the adjoint computes the sensitivity of the
+current UHP body's mean vertical velocity to each phase's density, dislocation-creep prefactor
+`A`, and exponent `n`, and the state is written to VTK in `vtk_dir`. `adjoint = false` skips the
+adjoint. The return value contains the forward solver output, the observation cost, and the
+phase-wise material gradients.
 """
 function dora_maira_vertical_weak_zone(
         igg;
         nx = 256,
-        ny = 250,
+        # Δy = 110 km / ny; ny = 2nx keeps the weak-zone cells at ≈ 2.5:1 instead of ≈ 5:1
+        ny = 2nx,
         lx = 55e3,
         nsteps = 100,
+        nout = 10,
         figdir = "DoraMairaVerticalWeakZone",
+        vtk_dir = joinpath(@__DIR__, "vtk_dora_maira"),
         adjoint = true,
         verbose_PH = true,
-        adjoint_every = 10,
+        # (ηmin, ηmax) in Pa s for every solve; the paper's lower bound is 10¹⁶ Pa s
+        viscosity_cutoff = (1e18, 1e22),
     )
     # Schmalholz & Schenker (2016) reference geometry: 125 km × 110 km domain,
     # 5 km-thick weak layer, and a 20 km × 3 km UHP ellipse. The default 55 km width is
@@ -260,7 +324,8 @@ function dora_maira_vertical_weak_zone(
     ly = 110e3
     weak_zone_width = 5e3
     lx > weak_zone_width || throw(ArgumentError("lx must exceed the 5 km weak-zone width"))
-    adjoint_every ≥ 1 || throw(ArgumentError("adjoint_every must be at least one step"))
+    nsteps ≥ 1 || throw(ArgumentError("nsteps must be positive"))
+    nout ≥ 1 || throw(ArgumentError("nout must be positive"))
     xv = poisson_horizontal_vertices(nx, lx, weak_zone_width)
     yv = collect(range(-ly, 0.0; length = ny + 1))
     grid = Geometry(PTArray(backend), xv, yv)
@@ -294,7 +359,6 @@ function dora_maira_vertical_weak_zone(
     temperature = dora_maira_temperature(grid)
     dt = 1.0e11
     args = (; T = temperature, P = stokes.P, dt)
-    viscosity_cutoff = 1e16, 1e22
     compute_ρg!(ρg, phase_ratios, rheology, args)
     initialize_dora_maira_pressure!(stokes.P, grid, gravity)
     stokes.P0 .= stokes.P
@@ -305,50 +369,54 @@ function dora_maira_vertical_weak_zone(
 
     dyrel = DYREL(backend, stokes, rheology, phase_ratios, ϕ, grid.di, dt, γfact = 20.0; ϵ = 1e-4)
     observation = nothing
-    gradients = material_controls(backend, ni, (:ρ, :A, :n); nphases = length(rheology))
+    gradients = adjoint ? material_controls(
+        backend, ni, (:ρ, :A, :n); nphases = length(rheology),
+    ) : (;)
     output = nothing
+    time = 0.0
 
     for step in 1:nsteps
-        run_adjoint = adjoint && (step % adjoint_every == 0 || step == nsteps)
+        write_output = step % nout == 0 || step == nsteps
+        run_adjoint = adjoint && write_output
         # Rebuild the objective from the current phase ratios after particle advection.
         run_adjoint && (observation = uhp_observation(phase_ratios, 3, stokes.V.Vy))
-        # Continuation reaches the paper's 10¹⁶ Pa s lower bound from a well-conditioned
-        # initial Stokes solve.  Only the final stage is used for the physical time step.
-        cutoff_stages = step == 1 ? (
-            (1e18, viscosity_cutoff[2]), (1e17, viscosity_cutoff[2]), viscosity_cutoff,
-        ) : (viscosity_cutoff,)
-        for (stage, active_cutoff) in pairs(cutoff_stages)
-            final_stage = stage == lastindex(cutoff_stages)
-            args = (; T = temperature, P = stokes.P, dt)
-            output = solve_VariationalDYREL!(
-                stokes,
-                run_adjoint && final_stage ? stokes_ad : nothing,
-                ρg,
-                dyrel,
-                flow_bcs,
-                phase_ratios,
-                ϕ,
-                rheology,
-                args,
-                grid,
-                dt,
-                igg;
-                verbose_PH,
-                verbose_DR = false,
-                iterMax = 50_000,
-                total_iterMax = 200_000,
-                nout = 10,
-                rel_drop = 1e-1,
-                viscosity_relaxation = 1.0e-2,
-                viscosity_cutoff = active_cutoff,
-                linear_viscosity = false,
-                air_phase = 0,
-                adjoint = run_adjoint && final_stage,
-                observation,
-                gradients = run_adjoint && final_stage ? gradients : (;),
-            )
-            final_stage || copyto!(stokes.P0, stokes.P)
-        end
+        args = (; T = temperature, P = stokes.P, dt)
+        output = solve_VariationalDYREL!(
+            stokes,
+            run_adjoint ? stokes_ad : nothing,
+            ρg,
+            dyrel,
+            flow_bcs,
+            phase_ratios,
+            ϕ,
+            rheology,
+            args,
+            grid,
+            dt,
+            igg;
+            verbose_PH,
+            verbose_DR = false,
+            iterMax = 50_000,
+            total_iterMax = 200_000,
+            nout = 10,
+            rel_drop = 0.5,
+            viscosity_relaxation = 1.0e-2,
+            viscosity_cutoff,
+            linear_viscosity = false,
+            air_phase = 0,
+            adjoint = run_adjoint,
+            observation,
+            gradients = run_adjoint ? gradients : (;),
+        )
+        time += dt
+        tensor_invariant!(stokes.τ)
+        tensor_invariant!(stokes.ε)
+        write_output && save_dora_maira_vtk!(
+            vtk_dir, step, time, grid, stokes, ρg, phase_ratios, temperature, gravity;
+            observation = run_adjoint ? observation : nothing,
+            stokes_ad = run_adjoint ? stokes_ad : nothing,
+            gradients = run_adjoint ? gradients : nothing,
+        )
 
         step == nsteps && break
 
@@ -360,11 +428,14 @@ function dora_maira_vertical_weak_zone(
         update_rock_ratio!(ϕ, phase_ratios, 0)
     end
 
-    return (; output, stokes, phase_ratios, gradients)
+    # J = Σ weights · Vy, the objective of the last adjoint solve
+    cost = adjoint ? sum(observation.weights .* stokes.V.Vy) : nothing
+    return (; output, cost, stokes, stokes_ad, grid, particles, particle_phases = pPhases,
+        phase_ratios, ρg, gradients, observation)
 end
 
 if !@isdefined(NO_AUTORUN)
-    let nx = 128, ny = 128
+    let nx = 64, ny = 2*nx
         ImplicitGlobalGrid.grid_is_initialized() && finalize_global_grid(; finalize_MPI = false)
         igg = IGG(init_global_grid(nx, ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
         Base.invokelatest(dora_maira_vertical_weak_zone, igg; nx, ny)

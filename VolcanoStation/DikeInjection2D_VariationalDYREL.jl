@@ -16,7 +16,7 @@ original FEM model's thermal diffusion and station-network optimisation are not 
 using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
-const isCUDA = true
+const isCUDA = false
 
 @static if isCUDA
     using CUDA
@@ -288,7 +288,7 @@ function dike_injection_variational_dyrel(
         nx = 320,
         ny = 176,
         nsteps = 200,
-        nout = 2,
+        nout = 10,
         dt = year,
         Q_dike = 1.0e-4,
         strain_rate = 1.0e-30,
